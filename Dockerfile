@@ -1,9 +1,12 @@
 # syntax=docker/dockerfile:1
 
 # Build natively on runner architecture using Go's built-in cross compilation
-FROM --platform=$BUILDPLATFORM golang:1.24-bookworm AS builder
+FROM --platform=$BUILDPLATFORM golang:bookworm AS builder
 
 WORKDIR /src
+
+# Allow Go to automatically download required toolchain (e.g. go1.27 for tailscale.com)
+ENV GOTOOLCHAIN=auto
 
 COPY go.mod go.sum ./
 COPY . .
