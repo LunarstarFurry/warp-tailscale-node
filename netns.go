@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -153,7 +155,7 @@ func up(cfg *Config) error {
 	configPath, _ := filepath.Abs(cfgPathFlag)
 	cmd := exec.Command(self, "serve", "--config", configPath)
 	cmd.Env = append(os.Environ(), "WARP_EXIT_ENDPOINT_IP="+endpoint.IP.String())
-	cmd.Stdout, cmd.Stderr = logf, logf
+	cmd.Stdout, cmd.Stderr = io.MultiWriter(os.Stdout, logf), io.MultiWriter(os.Stderr, logf)
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Cloneflags: syscall.CLONE_NEWNET | syscall.CLONE_NEWNS,
 		Setpgid:    true,
@@ -162,7 +164,6 @@ func up(cfg *Config) error {
 		return fmt.Errorf("spawn daemon: %w", err)
 	}
 	pid := cmd.Process.Pid
-	go cmd.Wait()
 	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(pid)), 0o644); err != nil {
 		return err
 	}
@@ -227,13 +228,22 @@ func up(cfg *Config) error {
 	}
 
 	fmt.Printf("\ndaemon started (pid %d)\nlogs: %s\n", pid, logPath)
-	return waitForLogin()
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		<-sig
+		teardown()
+		os.Exit(0)
+	}()
+	_ = waitForLogin()
+	return cmd.Wait()
 }
 
 // waitForLogin watches the daemon's status file and surfaces the auth URL —
 // no log-file digging needed on first run.
 func waitForLogin() error {
-	deadline := time.Now().Add(90 * time.Second)
+	var loggedURL bool
+	deadline := time.Now().Add(15 * time.Minute)
 	var approveDeadline time.Time
 	for time.Now().Before(deadline) {
 		if b, err := os.ReadFile(statusPath); err == nil {
@@ -241,9 +251,6 @@ func waitForLogin() error {
 			if json.Unmarshal(b, &s) == nil {
 				switch {
 				case s.BackendState == "Running":
-					// PrimaryRoutes (approval state) arrives in the first
-					// netmap after Running — give it a few seconds before
-					// claiming approval is still needed.
 					if !s.AdvertiseExitNode {
 						if approveDeadline.IsZero() {
 							approveDeadline = time.Now().Add(10 * time.Second)
@@ -252,24 +259,23 @@ func waitForLogin() error {
 							break
 						}
 					}
-					fmt.Printf("node online: %s", strings.Join(s.TailscaleIPs, ", "))
+					fmt.Printf("\nnode online: %s", strings.Join(s.TailscaleIPs, ", "))
 					if s.AdvertiseExitNode {
 						fmt.Println(" — exit-node routes approved")
 					} else {
 						fmt.Println(" — approve exit-node routes in the admin console")
 					}
 					return nil
-				case s.AuthURL != "":
+				case s.AuthURL != "" && !loggedURL:
 					fmt.Printf("\nnode login required — open:\n\n  %s\n\n", s.AuthURL)
-					fmt.Println("after login it will come up automatically (warp-exit status)")
-					fmt.Println("then approve its exit-node routes in the admin console")
-					return nil
+					fmt.Println("waiting for node registration on Headscale...")
+					loggedURL = true
 				}
 			}
 		}
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(1 * time.Second)
 	}
-	fmt.Println("daemon still starting — run `warp-exit status` to see the login link")
+	fmt.Println("timed out waiting for login")
 	return nil
 }
 
