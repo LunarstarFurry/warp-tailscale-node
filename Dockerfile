@@ -1,19 +1,18 @@
-# Multi-stage build for warp-tailscale-node
-FROM golang:1.24-bookworm AS builder
+# syntax=docker/dockerfile:1
+
+# Build natively on runner architecture using Go's built-in cross compilation
+FROM --platform=$BUILDPLATFORM golang:1.24-bookworm AS builder
 
 WORKDIR /src
 
 COPY go.mod go.sum ./
-RUN go mod download
-
 COPY . .
 
-# Build statically linked binary
 ARG TARGETOS TARGETARCH
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
-    go build -v -ldflags="-s -w" -o /warp-exit .
+    go build -ldflags="-s -w" -o /warp-exit .
 
-# Final runtime image
+# Final runtime image for target platform
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -24,10 +23,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     iproute2 \
     procps \
     wireguard-tools \
+    gnupg \
     && rm -rf /var/lib/apt/lists/*
 
-# Install official tailscale binary
-RUN curl -fsSL https://tailscale.com/install.sh | sh
+# Install official tailscale via package repository
+RUN mkdir -p /usr/share/keyrings /etc/apt/sources.list.d && \
+    curl -fsSL https://pkgs.tailscale.com/stable/debian/bookworm.noarmor.gpg | tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null && \
+    curl -fsSL https://pkgs.tailscale.com/stable/debian/bookworm.tailscale-keyring.list | tee /etc/apt/sources.list.d/tailscale.list && \
+    apt-get update && apt-get install -y --no-install-recommends tailscale && \
+    rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /warp-exit /usr/local/bin/warp-exit
 
